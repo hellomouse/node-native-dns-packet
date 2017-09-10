@@ -11,17 +11,17 @@
     "dns",
     "parsing"
   ],
-  "homepage": "http://github.com/tjfontaine/native-dns-packet",
+  "homepage": "https://github.com/valoran-labs/node-native-dns-packet",
   "bugs": {
-    "url": "http://github.com/tjfontaine/native-dns-packet/issues"
+    "url": "https://github.com/valoran-labs/node-native-dns-packet/issues"
   },
   "repository": {
     "type": "git",
-    "url": "http://github.com/tjfontaine/native-dns-packet.git"
+    "url": "https://github.com/valoran-labs/node-native-dns-packet"
   },
   "main": "index.js",
   "engines": {
-    "node": ">= 0.5.0"
+    "node": ">= 6.11.3"
   },
   "license": "MIT",
   "scripts": {
