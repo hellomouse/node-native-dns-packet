@@ -11,13 +11,13 @@
     "dns",
     "parsing"
   ],
-  "homepage": "https://github.com/valoran-labs/node-native-dns-packet",
+  "homepage": "https://github.com/hellomouse/node-native-dns-packet",
   "bugs": {
-    "url": "https://github.com/valoran-labs/node-native-dns-packet/issues"
+    "url": "https://github.com/hellomouse/node-native-dns-packet/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/valoran-labs/node-native-dns-packet"
+    "url": "https://github.com/hellomouse/node-native-dns-packet"
   },
   "main": "index.js",
   "engines": {

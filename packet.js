@@ -152,7 +152,11 @@ var
   WRITE_SOA   = consts.NAME_TO_QTYPE.SOA,
   WRITE_OPT   = consts.NAME_TO_QTYPE.OPT,
   WRITE_NAPTR = consts.NAME_TO_QTYPE.NAPTR,
-  WRITE_TLSA  = consts.NAME_TO_QTYPE.TLSA;
+  WRITE_TLSA  = consts.NAME_TO_QTYPE.TLSA,
+  WRITE_DNSKEY  = consts.NAME_TO_QTYPE.DNSKEY,
+  WRITE_SSHFP = consts.NAME_TO_QTYPE.SSHFP,
+  WRITE_CAA   = consts.NAME_TO_QTYPE.CAA,
+  WRITE_URI   = consts.NAME_TO_QTYPE.URI;
 
 function writeHeader(buff, packet) {
   assert(packet.header, 'Packet requires "header"');
@@ -180,7 +184,8 @@ function writeHeader(buff, packet) {
   buff.writeUInt16BE(packet.additional.length & 0xFFFF);
   return WRITE_QUESTION;
 }
-
+let count = 0;
+let last_resource = 0;
 function writeTruncate(buff, packet, section, val) {
   // XXX FIXME TODO truncation is currently done wrong.
   // Quote rfc2181 section 9
@@ -296,7 +301,26 @@ function writeMx(buff, val, label_index) {
   namePack(val.exchange, buff, label_index);
   return WRITE_RESOURCE_DONE;
 }
-
+function writeDnskey(buff, val, label_index) {
+  assertUndefined(val.algorithm, 'DNSKEY record requires "algorithm"');
+  assertUndefined(val.key, 'DNSKEY record requires "key"');
+  assertUndefined(val.flags, 'DNSKEY record requires "flags"');
+  assertUndefined(val.protocol, 'DNSKEY record requires "protocol"');
+  buff.writeUInt16BE(val.flags);
+  buff.writeUInt8(val.protocol);
+  buff.writeUInt8(val.algorithm);
+  namePack(val.key, buff, label_index);
+  return WRITE_RESOURCE_DONE;
+}
+function writeSshfp(buff, val, label_index) {
+  assertUndefined(val.algorithm, 'SSHFP record requires "algorithm"');
+  assertUndefined(val.hash, 'SSHFP record requires "hash"');
+  assertUndefined(val.fingerprint, 'SSHFP record requires "fingerprint"');
+  buff.writeUInt8(val.algorithm);
+  buff.writeUInt8(val.hash);
+  buff.write(Buffer(val.fingerprint,"hex").toString("binary"),"binary");
+  return WRITE_RESOURCE_DONE;
+}
 // SRV: https://tools.ietf.org/html/rfc2782
 // TODO: SRV fixture failing for '_xmpp-server._tcp.gmail.com.srv.js'
 function writeSrv(buff, val, label_index) {
@@ -361,7 +385,31 @@ function writeTlsa(buff, val) {
   buff.copy(val.buff);
   return WRITE_RESOURCE_DONE;
 }
-
+//
+function writeCaa(buff, val) {
+  assertUndefined(val.flags, 'CAA record requires "flags"');
+  assertUndefined(val.tag, 'CAA record requires "tag"');
+  assertUndefined(val.value, 'CAA record requires "value"');
+  buff.writeUInt8(val.flags);
+  buff.writeUInt8(val.tag.length);
+  buff.copy(Buffer(val.tag));
+  buff.copy(Buffer(val.value));
+  return WRITE_RESOURCE_DONE;
+}
+function writeUri(buff, val) {
+  //TODO XXX FIXME -- split on max char string and loop
+  assertUndefined(val.priority, 'URI record requires "priority"');
+  assertUndefined(val.weight, 'URI record requires "weight"');
+  assertUndefined(val.target, 'URI record requires "target"');
+  buff.writeUInt16BE(val.priority & 0xFFFF);
+  buff.writeUInt16BE(val.weight & 0xFFFF);
+//  for (var i=0,len=val.target.length; i<len; i++) {
+    var dataLen = Buffer.byteLength(val.target, 'utf8');
+    //buff.writeUInt8(dataLen);
+    buff.write(val.target, dataLen, 'utf8');
+  //}
+  return WRITE_RESOURCE_DONE;
+}
 function makeEdns(packet) {
   packet.edns = {
     name: '',
@@ -480,6 +528,18 @@ Packet.write = function(buff, packet) {
           break;
         case WRITE_TLSA:
           state = writeTlsa(buff, val);
+          break;
+        case WRITE_DNSKEY:
+          state = writeDnskey(buff, val, label_index);
+          break;
+        case WRITE_SSHFP:
+          state = writeSshfp(buff, val, label_index);
+          break;
+        case WRITE_CAA:
+          state = writeCaa(buff, val, label_index);
+          break;
+        case WRITE_URI:
+          state = writeUri(buff, val, label_index);
           break;
         case WRITE_END:
           return buff.tell();
@@ -678,7 +738,6 @@ var
   PARSE_OPT   = consts.NAME_TO_QTYPE.OPT,
   PARSE_SPF   = consts.NAME_TO_QTYPE.SPF,
   PARSE_TLSA  = consts.NAME_TO_QTYPE.TLSA;
-  
 
 Packet.parse = function(msg) {
   var state,
