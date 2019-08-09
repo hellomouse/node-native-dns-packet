@@ -25,59 +25,266 @@
 
 'use strict';
 
-var consts = require('./consts'),
-    BufferCursor = require('buffercursor'),
-    BufferCursorOverflow = BufferCursor.BufferCursorOverflow,
-    ipaddr = require('ipaddr.js'),
-    assert = require('assert'),
-    util = require('util');
+const consts = require('./consts');
+const BufferCursor = require('buffercursor');
+const BufferCursorOverflow = BufferCursor.BufferCursorOverflow;
+const ipaddr = require('ipaddr.js');
+const assert = require('assert');
+const util = require('util');
 
 function assertUndefined(val, msg) {
   assert(typeof val != 'undefined', msg);
 }
 
-var Packet = module.exports = function() {
-  this.header = {
-    id: 0,
-    qr: 0,
-    opcode: 0,
-    aa: 0,
-    tc: 0,
-    rd: 1,
-    ra: 0,
-    res1: 0,
-    res2: 0,
-    res3: 0,
-    rcode: 0
-  };
-  this.question = [];
-  this.answer = [];
-  this.authority = [];
-  this.additional = [];
-  this.edns_options = [];   // TODO: DEPRECATED! Use `.edns.options` instead!
-  this.payload = undefined; // TODO: DEPRECATED! Use `.edns.payload` instead!
+module.exports = class Packet {
+  constructor() {
+    this.header = {
+      id: 0,
+      qr: 0,
+      opcode: 0,
+      aa: 0,
+      tc: 0,
+      rd: 1,
+      ra: 0,
+      res1: 0,
+      res2: 0,
+      res3: 0,
+      rcode: 0
+    };
+    this.question = [];
+    this.answer = [];
+    this.authority = [];
+    this.additional = [];
+    this.edns_options = []; // TODO: DEPRECATED! Use `.edns.options` instead!
+    this.payload = undefined; // TODO: DEPRECATED! Use `.edns.payload` instead!
+  }
+  static write(buff, packet) {
+    let state = WRITE_HEADER; let val; let section; let count; let rdata; let last_resource; const label_index = {};
+    buff = new BufferCursor(buff);
+    // the existence of 'edns' in a packet indicates that a proper OPT record exists
+    // in 'additional' and that all of the other fields in packet (that are parsed by
+    // 'parseOpt') are properly set. If it does not exist, we assume that the user
+    // is requesting that we create one for them.
+    if (typeof packet.edns_version !== 'undefined' && typeof packet.edns === 'undefined') {
+      state = makeEdns(packet);
+    }
+    // TODO: this is unnecessarily inefficient. rewrite this using a
+    //       function table instead. (same for Packet.parse too).
+    while (true) {
+      try {
+        switch (state) {
+        case WRITE_HEADER:
+          state = writeHeader(buff, packet);
+          break;
+        case WRITE_TRUNCATE:
+          state = writeTruncate(buff, packet, section, last_resource);
+          break;
+        case WRITE_QUESTION:
+          state = writeQuestion(buff, packet.question[0], label_index);
+          section = 'answer';
+          count = 0;
+          break;
+        case WRITE_RESOURCE_RECORD:
+          last_resource = buff.tell();
+          if (packet[section].length == count) {
+            switch (section) {
+            case 'answer':
+              section = 'authority';
+              state = WRITE_RESOURCE_RECORD;
+              break;
+            case 'authority':
+              section = 'additional';
+              state = WRITE_RESOURCE_RECORD;
+              break;
+            case 'additional':
+              state = WRITE_END;
+              break;
+            }
+            count = 0;
+          } else {
+            state = WRITE_RESOURCE_WRITE;
+          }
+          break;
+        case WRITE_RESOURCE_WRITE:
+          rdata = {};
+          val = packet[section][count];
+          state = writeResource(buff, val, label_index, rdata);
+          break;
+        case WRITE_RESOURCE_DONE:
+          count += 1;
+          state = writeResourceDone(buff, rdata);
+          break;
+        case WRITE_A:
+        case WRITE_AAAA:
+          state = writeIp(buff, val);
+          break;
+        case WRITE_NS:
+        case WRITE_CNAME:
+        case WRITE_PTR:
+          state = writeCname(buff, val, label_index);
+          break;
+        case WRITE_SPF:
+        case WRITE_TXT:
+          state = writeTxt(buff, val);
+          break;
+        case WRITE_MX:
+          state = writeMx(buff, val, label_index);
+          break;
+        case WRITE_SRV:
+          state = writeSrv(buff, val, label_index);
+          break;
+        case WRITE_SOA:
+          state = writeSoa(buff, val, label_index);
+          break;
+        case WRITE_OPT:
+          state = writeOpt(buff, val);
+          break;
+        case WRITE_NAPTR:
+          state = writeNaptr(buff, val, label_index);
+          break;
+        case WRITE_TLSA:
+          state = writeTlsa(buff, val);
+          break;
+        case WRITE_DNSKEY:
+          state = writeDnskey(buff, val, label_index);
+          break;
+        case WRITE_SSHFP:
+          state = writeSshfp(buff, val, label_index);
+          break;
+        case WRITE_CAA:
+          state = writeCaa(buff, val, label_index);
+          break;
+        case WRITE_URI:
+          state = writeUri(buff, val, label_index);
+          break;
+        case WRITE_END:
+          return buff.tell();
+        default:
+          if (typeof val.data !== 'object') {
+            throw new Error('Packet.write Unknown State: ' + state);
+          }
+          // write unhandled RR type
+          buff.copy(val.data);
+          state = WRITE_RESOURCE_DONE;
+        }
+      } catch (e) {
+        if (e instanceof BufferCursorOverflow) {
+          state = WRITE_TRUNCATE;
+        } else {
+          throw e;
+        }
+      }
+    }
+  }
+  static parse(msg) {
+    let state = PARSE_HEADER;
+    const pos = 0; let val; let rdata; let section; let count;
+    const packet = new Packet();
+    msg = new BufferCursor(msg);
+    while (true) {
+      switch (state) {
+      case PARSE_HEADER:
+        state = parseHeader(msg, packet);
+        break;
+      case PARSE_QUESTION:
+        state = parseQuestion(msg, packet);
+        section = 'answer';
+        count = 0;
+        break;
+      case PARSE_RESOURCE_RECORD:
+        // console.log('PARSE_RESOURCE_RECORD: count = %d, %s.len = %d', count, section, packet[section].length);
+        if (count === packet[section].length) {
+          switch (section) {
+          case 'answer':
+            section = 'authority';
+            count = 0;
+            break;
+          case 'authority':
+            section = 'additional';
+            count = 0;
+            break;
+          case 'additional':
+            state = PARSE_END;
+            break;
+          }
+        } else {
+          state = PARSE_RR_UNPACK;
+        }
+        break;
+      case PARSE_RR_UNPACK:
+        val = {};
+        rdata = {};
+        state = parseRR(msg, val, rdata);
+        break;
+      case PARSE_RESOURCE_DONE:
+        packet[section][count++] = val;
+        state = PARSE_RESOURCE_RECORD;
+        break;
+      case PARSE_A:
+        state = parseA(val, msg);
+        break;
+      case PARSE_AAAA:
+        state = parseAAAA(val, msg);
+        break;
+      case PARSE_NS:
+      case PARSE_CNAME:
+      case PARSE_PTR:
+        state = parseCname(val, msg);
+        break;
+      case PARSE_SPF:
+      case PARSE_TXT:
+        state = parseTxt(val, msg, rdata);
+        break;
+      case PARSE_MX:
+        state = parseMx(val, msg);
+        break;
+      case PARSE_SRV:
+        state = parseSrv(val, msg);
+        break;
+      case PARSE_SOA:
+        state = parseSoa(val, msg);
+        break;
+      case PARSE_OPT:
+        state = parseOpt(val, msg, rdata, packet);
+        break;
+      case PARSE_NAPTR:
+        state = parseNaptr(val, msg);
+        break;
+      case PARSE_TLSA:
+        state = parseTlsa(val, msg, rdata);
+        break;
+      case PARSE_END:
+        return packet;
+      default:
+        // console.log(state, val);
+        val.data = msg.slice(rdata.len);
+        state = PARSE_RESOURCE_DONE;
+        break;
+      }
+    }
+  }
 };
 
-var LABEL_POINTER = 0xC0;
+const LABEL_POINTER = 0xC0;
 
-var isPointer = function(len) {
+function isPointer(len) {
   return (len & LABEL_POINTER) === LABEL_POINTER;
-};
+}
 
 function nameUnpack(buff) {
-  var len, comp, end, pos, part, combine = '';
-
-  len = buff.readUInt8();
-  comp = false;
-  end = buff.tell();
+  let len = buff.readUInt8();
+  let comp = false;
+  let end = buff.tell();
+  let pos; let part; let combine = '';
 
   while (len !== 0) {
     if (isPointer(len)) {
       len -= LABEL_POINTER;
       len = len << 8;
       pos = len + buff.readUInt8();
-      if (!comp)
+      if (!comp) {
         end = buff.tell();
+      }
       buff.seek(pos);
       len = buff.readUInt8();
       comp = true;
@@ -86,15 +293,17 @@ function nameUnpack(buff) {
 
     part = buff.toString('ascii', len);
 
-    if (combine.length)
-      combine = combine + '.' + part;
-    else
+    if (combine.length) {
+      combine.concat(`.${part}`);
+    } else {
       combine = part;
+    }
 
     len = buff.readUInt8();
 
-    if (!comp)
+    if (!comp) {
       end = buff.tell();
+    }
   }
 
   buff.seek(end);
@@ -103,7 +312,7 @@ function nameUnpack(buff) {
 }
 
 function namePack(str, buff, index) {
-  var offset, dot, part;
+  let offset; let dot; let part;
 
   while (str) {
     if (index[str]) {
@@ -130,38 +339,38 @@ function namePack(str, buff, index) {
   }
 }
 
-var
-  WRITE_HEADER              = 100001,
-  WRITE_TRUNCATE            = 100002,
-  WRITE_QUESTION            = 100003,
-  WRITE_RESOURCE_RECORD     = 100004,
-  WRITE_RESOURCE_WRITE      = 100005,
-  WRITE_RESOURCE_DONE       = 100006,
-  WRITE_RESOURCE_END        = 100007,
-  WRITE_EDNS                = 100008,
-  WRITE_END                 = 100009,
-  WRITE_A     = consts.NAME_TO_QTYPE.A,
-  WRITE_AAAA  = consts.NAME_TO_QTYPE.AAAA,
-  WRITE_NS    = consts.NAME_TO_QTYPE.NS,
-  WRITE_CNAME = consts.NAME_TO_QTYPE.CNAME,
-  WRITE_PTR   = consts.NAME_TO_QTYPE.PTR,
-  WRITE_SPF   = consts.NAME_TO_QTYPE.SPF,
-  WRITE_MX    = consts.NAME_TO_QTYPE.MX,
-  WRITE_SRV   = consts.NAME_TO_QTYPE.SRV,
-  WRITE_TXT   = consts.NAME_TO_QTYPE.TXT,
-  WRITE_SOA   = consts.NAME_TO_QTYPE.SOA,
-  WRITE_OPT   = consts.NAME_TO_QTYPE.OPT,
-  WRITE_NAPTR = consts.NAME_TO_QTYPE.NAPTR,
-  WRITE_TLSA  = consts.NAME_TO_QTYPE.TLSA,
-  WRITE_DNSKEY  = consts.NAME_TO_QTYPE.DNSKEY,
-  WRITE_SSHFP = consts.NAME_TO_QTYPE.SSHFP,
-  WRITE_CAA   = consts.NAME_TO_QTYPE.CAA,
-  WRITE_URI   = consts.NAME_TO_QTYPE.URI;
+const
+  WRITE_HEADER = 100001;
+const WRITE_TRUNCATE = 100002;
+const WRITE_QUESTION = 100003;
+const WRITE_RESOURCE_RECORD = 100004;
+const WRITE_RESOURCE_WRITE = 100005;
+const WRITE_RESOURCE_DONE = 100006;
+const WRITE_RESOURCE_END = 100007;
+const WRITE_EDNS = 100008;
+const WRITE_END = 100009;
+const WRITE_A = consts.NAME_TO_QTYPE.A;
+const WRITE_AAAA = consts.NAME_TO_QTYPE.AAAA;
+const WRITE_NS = consts.NAME_TO_QTYPE.NS;
+const WRITE_CNAME = consts.NAME_TO_QTYPE.CNAME;
+const WRITE_PTR = consts.NAME_TO_QTYPE.PTR;
+const WRITE_SPF = consts.NAME_TO_QTYPE.SPF;
+const WRITE_MX = consts.NAME_TO_QTYPE.MX;
+const WRITE_SRV = consts.NAME_TO_QTYPE.SRV;
+const WRITE_TXT = consts.NAME_TO_QTYPE.TXT;
+const WRITE_SOA = consts.NAME_TO_QTYPE.SOA;
+const WRITE_OPT = consts.NAME_TO_QTYPE.OPT;
+const WRITE_NAPTR = consts.NAME_TO_QTYPE.NAPTR;
+const WRITE_TLSA = consts.NAME_TO_QTYPE.TLSA;
+const WRITE_DNSKEY = consts.NAME_TO_QTYPE.DNSKEY;
+const WRITE_SSHFP = consts.NAME_TO_QTYPE.SSHFP;
+const WRITE_CAA = consts.NAME_TO_QTYPE.CAA;
+const WRITE_URI = consts.NAME_TO_QTYPE.URI;
 
 function writeHeader(buff, packet) {
   assert(packet.header, 'Packet requires "header"');
   buff.writeUInt16BE(packet.header.id & 0xFFFF);
-  var val = 0;
+  let val = 0;
   val += (packet.header.qr << 15) & 0x8000;
   val += (packet.header.opcode << 11) & 0x7800;
   val += (packet.header.aa << 10) & 0x400;
@@ -184,8 +393,8 @@ function writeHeader(buff, packet) {
   buff.writeUInt16BE(packet.additional.length & 0xFFFF);
   return WRITE_QUESTION;
 }
-let count = 0;
-let last_resource = 0;
+const count = 0;
+const last_resource = 0;
 function writeTruncate(buff, packet, section, val) {
   // XXX FIXME TODO truncation is currently done wrong.
   // Quote rfc2181 section 9
@@ -199,7 +408,7 @@ function writeTruncate(buff, packet, section, val) {
   //
   // TODO IOW only set TC if we hit it in ANSWERS otherwise make sure an
   // entire RRSet is removed during a truncation.
-  var pos;
+  let pos;
 
   buff.seek(2);
   val = buff.readUInt16BE();
@@ -207,26 +416,26 @@ function writeTruncate(buff, packet, section, val) {
   buff.seek(2);
   buff.writeUInt16BE(val);
   switch (section) {
-    case 'answer':
-      pos = 6;
-      // seek to authority and clear it and additional out
-      buff.seek(8);
-      buff.writeUInt16BE(0);
-      buff.writeUInt16BE(0);
-      break;
-    case 'authority':
-      pos = 8;
-      // seek to additional and clear it out
-      buff.seek(10);
-      buff.writeUInt16BE(0);
-      break;
-    case 'additional':
-      pos = 10;
-      break;
+  case 'answer':
+    pos = 6;
+    // seek to authority and clear it and additional out
+    buff.seek(8);
+    buff.writeUInt16BE(0);
+    buff.writeUInt16BE(0);
+    break;
+  case 'authority':
+    pos = 8;
+    // seek to additional and clear it out
+    buff.seek(10);
+    buff.writeUInt16BE(0);
+    break;
+  case 'additional':
+    pos = 10;
+    break;
   }
   buff.seek(pos);
   buff.writeUInt16BE(count - 1); // TODO: count not defined!
-  buff.seek(last_resource);      // TODO: last_resource not defined!
+  buff.seek(last_resource); // TODO: last_resource not defined!
   return WRITE_END;
 }
 
@@ -253,12 +462,12 @@ function writeResource(buff, val, label_index, rdata) {
   buff.writeUInt32BE(val.ttl & 0xFFFFFFFF);
   rdata.pos = buff.tell();
   buff.writeUInt16BE(0); // if there is rdata, then this value will be updated
-                         // to the correct value by 'writeResourceDone'
+  // to the correct value by 'writeResourceDone'
   return val.type;
 }
 
 function writeResourceDone(buff, rdata) {
-  var pos = buff.tell();
+  const pos = buff.tell();
   buff.seek(rdata.pos);
   buff.writeUInt16BE(pos - rdata.pos - 2);
   buff.seek(pos);
@@ -266,7 +475,7 @@ function writeResourceDone(buff, rdata) {
 }
 
 function writeIp(buff, val) {
-  //TODO XXX FIXME -- assert that address is of proper type
+  // TODO XXX FIXME -- assert that address is of proper type
   assertUndefined(val.address, 'A/AAAA record requires "address"');
   val = ipaddr.parse(val.address).toByteArray();
   val.forEach(function(b) {
@@ -284,10 +493,10 @@ function writeCname(buff, val, label_index) {
 // For <character-string> see: http://tools.ietf.org/html/rfc1035#section-3.3
 // For TXT: http://tools.ietf.org/html/rfc1035#section-3.3.14
 function writeTxt(buff, val) {
-  //TODO XXX FIXME -- split on max char string and loop
+  // TODO XXX FIXME -- split on max char string and loop
   assertUndefined(val.data, 'TXT record requires "data"');
-  for (var i=0,len=val.data.length; i<len; i++) {
-    var dataLen = Buffer.byteLength(val.data[i], 'utf8');
+  for (let i = 0, len = val.data.length; i < len; i++) {
+    const dataLen = Buffer.byteLength(val.data[i], 'utf8');
     buff.writeUInt8(dataLen);
     buff.write(val.data[i], dataLen, 'utf8');
   }
@@ -318,7 +527,7 @@ function writeSshfp(buff, val, label_index) {
   assertUndefined(val.fingerprint, 'SSHFP record requires "fingerprint"');
   buff.writeUInt8(val.algorithm);
   buff.writeUInt8(val.hash);
-  buff.write(Buffer(val.fingerprint,"hex").toString("binary"),"binary");
+  buff.write(Buffer(val.fingerprint, 'hex').toString('binary'), 'binary');
   return WRITE_RESOURCE_DONE;
 }
 // SRV: https://tools.ietf.org/html/rfc2782
@@ -397,17 +606,17 @@ function writeCaa(buff, val) {
   return WRITE_RESOURCE_DONE;
 }
 function writeUri(buff, val) {
-  //TODO XXX FIXME -- split on max char string and loop
+  // TODO XXX FIXME -- split on max char string and loop
   assertUndefined(val.priority, 'URI record requires "priority"');
   assertUndefined(val.weight, 'URI record requires "weight"');
   assertUndefined(val.target, 'URI record requires "target"');
   buff.writeUInt16BE(val.priority & 0xFFFF);
   buff.writeUInt16BE(val.weight & 0xFFFF);
-//  for (var i=0,len=val.target.length; i<len; i++) {
-    var dataLen = Buffer.byteLength(val.target, 'utf8');
-    //buff.writeUInt8(dataLen);
-    buff.write(val.target, dataLen, 'utf8');
-  //}
+  //  for (let i=0,len=val.target.length; i<len; i++) {
+  const dataLen = Buffer.byteLength(val.target, 'utf8');
+  // buff.writeUInt8(dataLen);
+  buff.write(val.target, dataLen, 'utf8');
+  // }
   return WRITE_RESOURCE_DONE;
 }
 function makeEdns(packet) {
@@ -424,9 +633,8 @@ function makeEdns(packet) {
 }
 
 function writeOpt(buff, val) {
-  var opt;
-  for (var i=0, len=val.options.length; i<len; i++) {
-    opt = val.options[i];
+  for (let i = 0, len = val.options.length; i < len; i++) {
+    const opt = val.options[i];
     buff.writeUInt16BE(opt.code);
     buff.writeUInt16BE(opt.data.length);
     buff.copy(opt.data);
@@ -434,135 +642,10 @@ function writeOpt(buff, val) {
   return WRITE_RESOURCE_DONE;
 }
 
-Packet.write = function(buff, packet) {
-  var state = WRITE_HEADER,
-      val,
-      section,
-      count,
-      rdata,
-      last_resource,
-      label_index = {};
-
-  buff = new BufferCursor(buff);
-
-  // the existence of 'edns' in a packet indicates that a proper OPT record exists
-  // in 'additional' and that all of the other fields in packet (that are parsed by
-  // 'parseOpt') are properly set. If it does not exist, we assume that the user
-  // is requesting that we create one for them.
-  if (typeof packet.edns_version !== 'undefined' && typeof packet.edns === "undefined")
-    state = makeEdns(packet);
-
-  // TODO: this is unnecessarily inefficient. rewrite this using a
-  //       function table instead. (same for Packet.parse too).
-  while (true) {
-    try {
-      switch (state) {
-        case WRITE_HEADER:
-          state = writeHeader(buff, packet);
-          break;
-        case WRITE_TRUNCATE:
-          state = writeTruncate(buff, packet, section, last_resource);
-          break;
-        case WRITE_QUESTION:
-          state = writeQuestion(buff, packet.question[0], label_index);
-          section = 'answer';
-          count = 0;
-          break;
-        case WRITE_RESOURCE_RECORD:
-          last_resource = buff.tell();
-          if (packet[section].length == count) {
-            switch (section) {
-              case 'answer':
-                section = 'authority';
-                state = WRITE_RESOURCE_RECORD;
-                break;
-              case 'authority':
-                section = 'additional';
-                state = WRITE_RESOURCE_RECORD;
-                break;
-              case 'additional':
-                state = WRITE_END;
-                break;
-            }
-            count = 0;
-          } else {
-            state = WRITE_RESOURCE_WRITE;
-          }
-          break;
-        case WRITE_RESOURCE_WRITE:
-          rdata = {};
-          val = packet[section][count];
-          state = writeResource(buff, val, label_index, rdata);
-          break;
-        case WRITE_RESOURCE_DONE:
-          count += 1;
-          state = writeResourceDone(buff, rdata);
-          break;
-        case WRITE_A:
-        case WRITE_AAAA:
-          state = writeIp(buff, val);
-          break;
-        case WRITE_NS:
-        case WRITE_CNAME:
-        case WRITE_PTR:
-          state = writeCname(buff, val, label_index);
-          break;
-        case WRITE_SPF:
-        case WRITE_TXT:
-          state = writeTxt(buff, val);
-          break;
-        case WRITE_MX:
-          state = writeMx(buff, val, label_index);
-          break;
-        case WRITE_SRV:
-          state = writeSrv(buff, val, label_index);
-          break;
-        case WRITE_SOA:
-          state = writeSoa(buff, val, label_index);
-          break;
-        case WRITE_OPT:
-          state = writeOpt(buff, val);
-          break;
-        case WRITE_NAPTR:
-          state = writeNaptr(buff, val, label_index);
-          break;
-        case WRITE_TLSA:
-          state = writeTlsa(buff, val);
-          break;
-        case WRITE_DNSKEY:
-          state = writeDnskey(buff, val, label_index);
-          break;
-        case WRITE_SSHFP:
-          state = writeSshfp(buff, val, label_index);
-          break;
-        case WRITE_CAA:
-          state = writeCaa(buff, val, label_index);
-          break;
-        case WRITE_URI:
-          state = writeUri(buff, val, label_index);
-          break;
-        case WRITE_END:
-          return buff.tell();
-        default:
-          if (typeof val.data !== 'object')
-            throw new Error('Packet.write Unknown State: ' + state);
-          // write unhandled RR type
-          buff.copy(val.data);
-          state = WRITE_RESOURCE_DONE;
-      }
-    } catch (e) {
-      if (e instanceof BufferCursorOverflow) {
-        state = WRITE_TRUNCATE;
-      } else {
-        throw e;
-      }
-    }
-  }
-};
 
 function parseHeader(msg, packet) {
   packet.header.id = msg.readUInt16BE();
-  var val = msg.readUInt16BE();
+  const val = msg.readUInt16BE();
   packet.header.qr = (val & 0x8000) >> 15;
   packet.header.opcode = (val & 0x7800) >> 11;
   packet.header.aa = (val & 0x400) >> 10;
@@ -581,7 +664,7 @@ function parseHeader(msg, packet) {
 }
 
 function parseQuestion(msg, packet) {
-  var val = {};
+  const val = {};
   val.name = nameUnpack(msg);
   val.type = msg.readUInt16BE();
   val.class = msg.readUInt16BE();
@@ -601,7 +684,7 @@ function parseRR(msg, val, rdata) {
 }
 
 function parseA(val, msg) {
-  var address = '' +
+  const address = '' +
     msg.readUInt8() +
     '.' + msg.readUInt8() +
     '.' + msg.readUInt8() +
@@ -611,10 +694,10 @@ function parseA(val, msg) {
 }
 
 function parseAAAA(val, msg) {
-  var address = '';
-  var compressed = false;
+  let address = '';
+  const compressed = false;
 
-  for (var i = 0; i < 8; i++) {
+  for (let i = 0; i < 8; i++) {
     if (i > 0) address += ':';
     // TODO zero compression
     address += msg.readUInt16BE().toString(16);
@@ -630,9 +713,9 @@ function parseCname(val, msg) {
 
 function parseTxt(val, msg, rdata) {
   val.data = [];
-  var end = msg.tell() + rdata.len;
+  const end = msg.tell() + rdata.len;
   while (msg.tell() != end) {
-    var len = msg.readUInt8();
+    const len = msg.readUInt8();
     val.data.push(msg.toString('utf8', len));
   }
   return PARSE_RESOURCE_DONE;
@@ -669,7 +752,7 @@ function parseSoa(val, msg) {
 function parseNaptr(val, msg) {
   val.order = msg.readUInt16BE();
   val.preference = msg.readUInt16BE();
-  var len = msg.readUInt8();
+  let len = msg.readUInt8();
   val.flags = msg.toString('ascii', len);
   len = msg.readUInt8();
   val.service = msg.toString('ascii', len);
@@ -718,121 +801,24 @@ function parseOpt(val, msg, rdata, packet) {
   return PARSE_RESOURCE_DONE;
 }
 
-var
-  PARSE_HEADER          = 100000,
-  PARSE_QUESTION        = 100001,
-  PARSE_RESOURCE_RECORD = 100002,
-  PARSE_RR_UNPACK       = 100003,
-  PARSE_RESOURCE_DONE   = 100004,
-  PARSE_END             = 100005,
-  PARSE_A     = consts.NAME_TO_QTYPE.A,
-  PARSE_NS    = consts.NAME_TO_QTYPE.NS,
-  PARSE_CNAME = consts.NAME_TO_QTYPE.CNAME,
-  PARSE_SOA   = consts.NAME_TO_QTYPE.SOA,
-  PARSE_PTR   = consts.NAME_TO_QTYPE.PTR,
-  PARSE_MX    = consts.NAME_TO_QTYPE.MX,
-  PARSE_TXT   = consts.NAME_TO_QTYPE.TXT,
-  PARSE_AAAA  = consts.NAME_TO_QTYPE.AAAA,
-  PARSE_SRV   = consts.NAME_TO_QTYPE.SRV,
-  PARSE_NAPTR = consts.NAME_TO_QTYPE.NAPTR,
-  PARSE_OPT   = consts.NAME_TO_QTYPE.OPT,
-  PARSE_SPF   = consts.NAME_TO_QTYPE.SPF,
-  PARSE_TLSA  = consts.NAME_TO_QTYPE.TLSA;
+const PARSE_HEADER = 100000;
+const PARSE_QUESTION = 100001;
+const PARSE_RESOURCE_RECORD = 100002;
+const PARSE_RR_UNPACK = 100003;
+const PARSE_RESOURCE_DONE = 100004;
+const PARSE_END = 100005;
+const PARSE_A = consts.NAME_TO_QTYPE.A;
+const PARSE_NS = consts.NAME_TO_QTYPE.NS;
+const PARSE_CNAME = consts.NAME_TO_QTYPE.CNAME;
+const PARSE_SOA = consts.NAME_TO_QTYPE.SOA;
+const PARSE_PTR = consts.NAME_TO_QTYPE.PTR;
+const PARSE_MX = consts.NAME_TO_QTYPE.MX;
+const PARSE_TXT = consts.NAME_TO_QTYPE.TXT;
+const PARSE_AAAA = consts.NAME_TO_QTYPE.AAAA;
+const PARSE_SRV = consts.NAME_TO_QTYPE.SRV;
+const PARSE_NAPTR = consts.NAME_TO_QTYPE.NAPTR;
+const PARSE_OPT = consts.NAME_TO_QTYPE.OPT;
+const PARSE_SPF = consts.NAME_TO_QTYPE.SPF;
+const PARSE_TLSA = consts.NAME_TO_QTYPE.TLSA;
 
-Packet.parse = function(msg) {
-  var state,
-      pos,
-      val,
-      rdata,
-      section,
-      count;
 
-  var packet = new Packet();
-
-  pos = 0;
-  state = PARSE_HEADER;
-
-  msg = new BufferCursor(msg);
-
-  while (true) {
-    switch (state) {
-      case PARSE_HEADER:
-        state = parseHeader(msg, packet);
-        break;
-      case PARSE_QUESTION:
-        state = parseQuestion(msg, packet);
-        section = 'answer';
-        count = 0;
-        break;
-      case PARSE_RESOURCE_RECORD:
-        // console.log('PARSE_RESOURCE_RECORD: count = %d, %s.len = %d', count, section, packet[section].length);
-        if (count === packet[section].length) {
-          switch (section) {
-            case 'answer':
-              section = 'authority';
-              count = 0;
-              break;
-            case 'authority':
-              section = 'additional';
-              count = 0;
-              break;
-            case 'additional':
-              state = PARSE_END;
-              break;
-          }
-        } else {
-          state = PARSE_RR_UNPACK;
-        }
-        break;
-      case PARSE_RR_UNPACK:
-        val = {};
-        rdata = {};
-        state = parseRR(msg, val, rdata);
-        break;
-      case PARSE_RESOURCE_DONE:
-        packet[section][count++] = val;
-        state = PARSE_RESOURCE_RECORD;
-        break;
-      case PARSE_A:
-        state = parseA(val, msg);
-        break;
-      case PARSE_AAAA:
-        state = parseAAAA(val, msg);
-        break;
-      case PARSE_NS:
-      case PARSE_CNAME:
-      case PARSE_PTR:
-        state = parseCname(val, msg);
-        break;
-      case PARSE_SPF:
-      case PARSE_TXT:
-        state = parseTxt(val, msg, rdata);
-        break;
-      case PARSE_MX:
-        state = parseMx(val, msg);
-        break;
-      case PARSE_SRV:
-        state = parseSrv(val, msg);
-        break;
-      case PARSE_SOA:
-        state = parseSoa(val, msg);
-        break;
-      case PARSE_OPT:
-        state = parseOpt(val, msg, rdata, packet);
-        break;
-      case PARSE_NAPTR:
-        state = parseNaptr(val, msg);
-        break;
-      case PARSE_TLSA:
-        state = parseTlsa(val, msg, rdata);
-        break;
-      case PARSE_END:
-        return packet;
-      default:
-        //console.log(state, val);
-        val.data = msg.slice(rdata.len);
-        state = PARSE_RESOURCE_DONE;
-        break;
-    }
-  }
-};
