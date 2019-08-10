@@ -99,6 +99,7 @@ const WRITE_TLSA = consts.NAME_TO_QTYPE.TLSA;
 const WRITE_DNSKEY = consts.NAME_TO_QTYPE.DNSKEY;
 const WRITE_SSHFP = consts.NAME_TO_QTYPE.SSHFP;
 const WRITE_CAA = consts.NAME_TO_QTYPE.CAA;
+const WRITE_DS = consts.NAME_TO_QTYPE.DS;
 const WRITE_URI = consts.NAME_TO_QTYPE.URI;
 
 /** Represents a DNS packet */
@@ -231,6 +232,9 @@ class Packet {
             break;
           case WRITE_CAA:
             state = writeCaa(buff, val, labelIndex);
+            break;
+          case WRITE_DS:
+            state = writeDs(buff, val, labelIndex);
             break;
           case WRITE_URI:
             state = writeUri(buff, val, labelIndex);
@@ -634,6 +638,18 @@ function writeSshfp(buff, val, _labelIndex) {
   buff.writeUInt8(val.algorithm);
   buff.writeUInt8(val.hash);
   buff.write(Buffer.from(val.fingerprint, 'hex').toString('binary'), 'binary');
+  return WRITE_RESOURCE_DONE;
+}
+
+function writeDs(buff, val, _labelIndex) {
+  assertUndefined(val.tag, 'DS record requires "tag"');
+  assertUndefined(val.algorithm, 'DS record requires "algorithm"');
+  assertUndefined(val.digestAlgorithm, 'DS record requires "digestAlgorithm"');
+  assertUndefined(val.digest, 'DS record requires "digest"');
+  buff.writeUint16BE(val.tag & 0xffff);
+  buff.writeUint8(val.algorithm);
+  buff.writeUint8(val.digestAlgorithm);
+  buff.write(val.digest);
   return WRITE_RESOURCE_DONE;
 }
 
