@@ -28,10 +28,10 @@
     "test": "tap ./test/*.js"
   },
   "dependencies": {
-    "buffercursor": ">= 0.0.12",
-    "ipaddr.js": ">= 0.1.1"
+    "buffercursor": "~0.0.12",
+    "ipaddr.js": "^1.9.1"
   },
   "devDependencies": {
-    "tap": ">= 0.4.3"
+    "tap": "~14.6.1"
   }
 }
