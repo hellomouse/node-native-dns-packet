@@ -259,7 +259,7 @@ class Packet {
     }
   }
 
-  parse(msg) {
+  static parse(msg) {
     let state = PARSE_HEADER;
     let pos = 0;
     let val;
