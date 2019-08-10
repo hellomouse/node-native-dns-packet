@@ -26,11 +26,8 @@
  * @return {object}
  */
 function reverseMap(src) {
-  const dst = {};
-
-  for (const k of src) {
-    dst[src[k]] = k;
-  }
+  let dst = {};
+  for (let [key, value] of Object.entries(src)) dst[value] = key;
   return dst;
 }
 
